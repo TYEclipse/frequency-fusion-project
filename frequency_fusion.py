@@ -21,6 +21,7 @@ def create_frequency_weight_matrix(
 ) -> np.ndarray:
     """
     构建频域权重矩阵，从中心（低频）到边缘（高频）的过渡
+    - 修正最大距离计算：使用到四个角点的最大欧氏距离，保证归一化范围正确
     - 处理小图像和 max_distance==0 的边界情况
     - 在应用非线性函数前将归一化距离裁剪到 [0,1]
     """
@@ -33,8 +34,15 @@ def create_frequency_weight_matrix(
     # 计算每个点到中心的距离
     distance = np.sqrt((y - center_row)**2 + (x - center_col)**2)
 
-    # 计算最大距离（对角线的一半），保证非零
-    max_distance = np.hypot(center_row, center_col)
+    # 计算最大距离（使用到四个角点的最大距离以更精确归一化）
+    corner_coords = [(0, 0), (0, cols - 1),
+                     (rows - 1, 0), (rows - 1, cols - 1)]
+    max_distance = 0.0
+    for (r, c) in corner_coords:
+        d = np.hypot(r - center_row, c - center_col)
+        if d > max_distance:
+            max_distance = d
+
     if max_distance == 0:
         return np.ones((rows, cols), dtype=np.float32)
 
@@ -71,7 +79,8 @@ def frequency_fusion(
     filter_type: Literal['linear', 'gaussian',
                          'cosine', 'quadratic'] = 'linear',
     color_space: Literal['YUV', 'Lab'] = 'YUV',
-    visualize: bool = False
+    visualize: bool = False,
+    fuse_luminance_only: bool = True
 ) -> np.ndarray:
     """
     基于频域的图像融合算法
@@ -83,6 +92,11 @@ def frequency_fusion(
         filter_type: 频域权重过渡方式 ('linear', 'gaussian', 'cosine', 'quadratic')
         color_space: 色彩空间 ('YUV' 或 'Lab')
         visualize: 是否可视化中间结果
+
+    新增参数:
+        fuse_luminance_only: 若为 True，则仅对色彩空间的通道0（Y 或 L）做频域融合，
+                            其余通道直接从 enhanced_img 保留（以保持色彩）。
+                            设为 False 则对所有通道都做频域融合（与原行为一致）。
 
     返回:
         融合后的BGR图像
@@ -107,121 +121,124 @@ def frequency_fusion(
                                    original_img.shape[0]),
                                   interpolation=cv2.INTER_CUBIC)
 
-    # ==================== 步骤2: 色彩空间转换 ====================
+    # ==================== 步骤2: 色彩空间转换（保留三通道） ====================
     print(f"[2/6] 转换色彩空间到 {color_space}...")
     if color_space == 'YUV':
-        # 转换到YUV色彩空间
-        original_yuv = cv2.cvtColor(original_img, cv2.COLOR_BGR2YUV)
-        enhanced_yuv = cv2.cvtColor(enhanced_img, cv2.COLOR_BGR2YUV)
-
-        # 提取亮度通道（Y）
-        original_luma = original_yuv[:, :, 0].astype(np.float32)
-        enhanced_luma = enhanced_yuv[:, :, 0].astype(np.float32)
-
+        original_space = cv2.cvtColor(original_img, cv2.COLOR_BGR2YUV)
+        enhanced_space = cv2.cvtColor(enhanced_img, cv2.COLOR_BGR2YUV)
     elif color_space == 'Lab':
-        # 转换到Lab色彩空间
-        original_lab = cv2.cvtColor(original_img, cv2.COLOR_BGR2Lab)
-        enhanced_lab = cv2.cvtColor(enhanced_img, cv2.COLOR_BGR2Lab)
-
-        # 提取亮度通道（L）
-        original_luma = original_lab[:, :, 0].astype(np.float32)
-        enhanced_luma = enhanced_lab[:, :, 0].astype(np.float32)
-
+        original_space = cv2.cvtColor(original_img, cv2.COLOR_BGR2Lab)
+        enhanced_space = cv2.cvtColor(enhanced_img, cv2.COLOR_BGR2Lab)
     else:
         raise ValueError(f"不支持的色彩空间: {color_space}")
 
-    # ==================== 步骤3: 傅里叶变换到频域 ====================
-    print(f"[3/6] 执行傅里叶变换...")
+    # ==================== 步骤3: 构建频域权重矩阵 ====================
+    print(f"[3/6] 构建频域权重矩阵...")
+    rows, cols = original_space.shape[:2]
+    weight_matrix = create_frequency_weight_matrix((rows, cols), filter_type)
 
-    # 确保亮度通道为 float32（cv2.dft 需要）
-    original_luma_f = original_luma.astype(np.float32)
-    enhanced_luma_f = enhanced_luma.astype(np.float32)
+    # 准备融合后三通道容器（保持 uint8）
+    fused_space = original_space.copy()
 
-    # 使用 cv2.dft 得到复数两通道表示
-    dft_original = cv2.dft(original_luma_f, flags=cv2.DFT_COMPLEX_OUTPUT)
-    dft_original_shifted = np.fft.fftshift(dft_original, axes=(0, 1))
+    # 为可视化保存通道0的频谱（原/增强/融合）
+    # 只保存通道0 的频谱用于可视化，避免在处理多个通道时占用大量内存
+    mag0_orig = None
+    mag0_enh = None
+    mag0_fused = None
 
-    dft_enhanced = cv2.dft(enhanced_luma_f, flags=cv2.DFT_COMPLEX_OUTPUT)
-    dft_enhanced_shifted = np.fft.fftshift(dft_enhanced, axes=(0, 1))
+    # 决定需要处理的通道索引（若只融合亮度則仅 c=0）
+    channels_to_process = [0] if fuse_luminance_only else [0, 1, 2]
 
-    # 使用 cartToPolar 更高效地获取幅值与相位（保持 float32）
-    magnitude_original, phase_original = cv2.cartToPolar(
-        dft_original_shifted[:, :, 0], dft_original_shifted[:,
-                                                            :, 1], angleInDegrees=False
-    )
-    # 只需要增强图的幅度（相位不使用），因此丢弃相位输出以节省内存/计算
-    magnitude_enhanced, _ = cv2.cartToPolar(
-        dft_enhanced_shifted[:, :, 0], dft_enhanced_shifted[:,
-                                                            :, 1], angleInDegrees=False
-    )
+    # ==================== 步骤4: 对每个通道在频域中融合 ====================
+    print(f"[4/6] 对通道执行频域融合 ({filter_type})... 处理通道: {channels_to_process}")
+    for c in range(3):
+        # 如果当前通道不在处理列表，直接从 enhanced 或 original 中选择保留策略
+        if c not in channels_to_process:
+            # 选择从 enhanced 保留色度更自然（因为增强通常改善色彩）
+            fused_space[:, :, c] = enhanced_space[:, :, c]
+            continue
 
-    # ==================== 步骤4: 构建频域权重矩阵并融合 ====================
-    print(f"[4/6] 构建 {filter_type} 权重矩阵并融合频谱...")
+        # 提取通道并转为 float32
+        orig_chan_f = original_space[:, :, c].astype(np.float32)
+        enh_chan_f = enhanced_space[:, :, c].astype(np.float32)
 
-    # 创建权重矩阵（中心为1，边缘为0）
-    weight_matrix = create_frequency_weight_matrix(
-        shape=original_luma.shape,
-        filter_type=filter_type
-    )
+        # DFT 并移位
+        dft_orig = cv2.dft(orig_chan_f, flags=cv2.DFT_COMPLEX_OUTPUT)
+        dft_orig_shift = np.fft.fftshift(dft_orig, axes=(0, 1))
 
-    fused_magnitude = (weight_matrix * magnitude_enhanced +
-                       (1.0 - weight_matrix) * magnitude_original).astype(np.float32)
+        dft_enh = cv2.dft(enh_chan_f, flags=cv2.DFT_COMPLEX_OUTPUT)
+        dft_enh_shift = np.fft.fftshift(dft_enh, axes=(0, 1))
 
-    fused_phase = phase_original.astype(np.float32)
+        # 幅值与相位
+        mag_orig, phase_orig = cv2.cartToPolar(
+            dft_orig_shift[:, :, 0], dft_orig_shift[:,
+                                                    :, 1], angleInDegrees=False
+        )
+        mag_enh, _ = cv2.cartToPolar(
+            dft_enh_shift[:, :, 0], dft_enh_shift[:,
+                                                  :, 1], angleInDegrees=False
+        )
 
-    # ==================== 步骤5: 逆傅里叶变换回空间域 ====================
-    print(f"[5/6] 执行逆傅里叶变换...")
+        # 融合幅值（增强图低频优先，原图高频保留）
+        fused_mag = (weight_matrix * mag_enh +
+                     (1.0 - weight_matrix) * mag_orig).astype(np.float32)
+        fused_phase = phase_orig.astype(np.float32)
 
-    # 用幅度和相位重建实部与虚部，确保 float32
-    fused_real = (fused_magnitude * np.cos(fused_phase)).astype(np.float32)
-    fused_imag = (fused_magnitude * np.sin(fused_phase)).astype(np.float32)
-    fused_dft_shifted = np.stack(
-        [fused_real, fused_imag], axis=-1).astype(np.float32)
+        # 仅在通道0 时保存频谱用于后续可视化，避免无谓内存分配
+        if c == 0:
+            mag0_orig = mag_orig
+            mag0_enh = mag_enh
+            mag0_fused = fused_mag
 
-    # 将零频分量移回原位（显式 axes）
-    fused_dft = np.fft.ifftshift(fused_dft_shifted, axes=(0, 1))
+        # 从幅值与相位重建复数频谱（实/虚）
+        fused_real = (fused_mag * np.cos(fused_phase)).astype(np.float32)
+        fused_imag = (fused_mag * np.sin(fused_phase)).astype(np.float32)
+        fused_dft_shifted = np.stack(
+            [fused_real, fused_imag], axis=-1).astype(np.float32)
 
-    # 执行逆DFT，得到单通道实数（float32）
-    fused_luma = cv2.idft(fused_dft, flags=cv2.DFT_SCALE | cv2.DFT_REAL_OUTPUT)
+        # 移回原位并逆 DFT
+        fused_dft = np.fft.ifftshift(fused_dft_shifted, axes=(0, 1))
+        fused_chan = cv2.idft(
+            fused_dft, flags=cv2.DFT_SCALE | cv2.DFT_REAL_OUTPUT)
 
-    # 裁剪到有效范围并转换为 uint8
-    fused_luma = np.clip(fused_luma, 0, 255).astype(np.uint8)
+        # 截断并写回 uint8 通道
+        fused_space[:, :, c] = np.clip(fused_chan, 0, 255).astype(np.uint8)
 
-    # ==================== 步骤6: 合并通道并转回BGR ====================
-    print(f"[6/6] 合并通道并转换回BGR色彩空间...")
-
-    # 合并融合后的亮度通道和原始的色度通道，直接在原始数组副本上赋值以保留类型与范围
+    # ==================== 步骤5: 转回 BGR 并保存 ====================
+    print(f"[5/6] 合并通道并转换回BGR色彩空间...")
     if color_space == 'YUV':
-        fused_yuv = original_yuv.copy()
-        fused_yuv[:, :, 0] = fused_luma
-        fused_bgr = cv2.cvtColor(fused_yuv, cv2.COLOR_YUV2BGR)
+        fused_bgr = cv2.cvtColor(fused_space, cv2.COLOR_YUV2BGR)
+    else:  # Lab
+        fused_bgr = cv2.cvtColor(fused_space, cv2.COLOR_Lab2BGR)
 
-    elif color_space == 'Lab':
-        fused_lab = original_lab.copy()
-        fused_lab[:, :, 0] = fused_luma
-        fused_bgr = cv2.cvtColor(fused_lab, cv2.COLOR_Lab2BGR)
-
-    # 确保输出目录存在
     out_dir = os.path.dirname(output_path)
     if out_dir and not os.path.exists(out_dir):
         os.makedirs(out_dir, exist_ok=True)
 
-    # 保存结果
-    cv2.imwrite(output_path, fused_bgr)
+    # 检查写入是否成功
+    ok = cv2.imwrite(output_path, fused_bgr)
+    if not ok:
+        raise IOError(f"无法写入融合图像到: {output_path}")
     print(f"✓ 融合图像已保存到: {output_path}")
 
-    # ==================== 可视化（可选）====================
+    # ==================== 步骤6: 可视化（可选，使用通道0幅值以保持原接口）====================
     if visualize:
-        # 计算可视化保存路径：优先使用 output_path 的目录，否则当前工作目录
-        vis_dir = os.path.dirname(output_path) if output_path else os.getcwd()
-        if vis_dir == "":
-            vis_dir = os.getcwd()
+        vis_dir = os.path.dirname(output_path) or os.getcwd()
+        os.makedirs(vis_dir, exist_ok=True)
         vis_save_path = os.path.join(vis_dir, 'fusion_visualization.png')
-        # 确保目录存在
-        os.makedirs(os.path.dirname(vis_save_path), exist_ok=True)
+
+        # 兼容原可视化函数：传递通道0 的幅值（若未计算过则从列表获取第一个）
+        # 兼容原可视化接口：若未计算到通道0 的频谱，则回退为零矩阵
+        if mag0_orig is None:
+            mag0_orig = np.zeros((rows, cols), dtype=np.float32)
+        if mag0_enh is None:
+            mag0_enh = np.zeros((rows, cols), dtype=np.float32)
+        if mag0_fused is None:
+            mag0_fused = np.zeros((rows, cols), dtype=np.float32)
+
         visualize_results(
             original_img, enhanced_img, fused_bgr,
-            magnitude_original, magnitude_enhanced, fused_magnitude,
+            mag0_orig, mag0_enh, mag0_fused,
             weight_matrix, filter_type,
             save_path=vis_save_path
         )
@@ -241,59 +258,59 @@ def visualize_results(
     save_path: Optional[str] = None
 ) -> None:
     """
-    可视化融合过程的中间结果
+    Visualize intermediate results of fusion process
     """
     fig = plt.figure(figsize=(18, 12))
 
-    # 第一行：空间域图像对比
+    # First row: spatial domain image comparison
     plt.subplot(3, 4, 1)
     plt.imshow(cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB))
-    plt.title('原始图像 (Original)', fontsize=12, fontweight='bold')
+    plt.title('Original Image', fontsize=12, fontweight='bold')
     plt.axis('off')
 
     plt.subplot(3, 4, 2)
     plt.imshow(cv2.cvtColor(enhanced_img, cv2.COLOR_BGR2RGB))
-    plt.title('增强图像 (Enhanced)', fontsize=12, fontweight='bold')
+    plt.title('Enhanced Image', fontsize=12, fontweight='bold')
     plt.axis('off')
 
     plt.subplot(3, 4, 3)
     plt.imshow(cv2.cvtColor(fused_img, cv2.COLOR_BGR2RGB))
-    plt.title('融合图像 (Fused)', fontsize=12, fontweight='bold')
+    plt.title('Fused Image', fontsize=12, fontweight='bold')
     plt.axis('off')
 
     plt.subplot(3, 4, 4)
     plt.imshow(weight_matrix, cmap='hot')
-    plt.title(f'权重矩阵 ({filter_type})', fontsize=12, fontweight='bold')
+    plt.title(f'Weight Matrix ({filter_type})', fontsize=12, fontweight='bold')
     plt.colorbar(fraction=0.046, pad=0.04)
     plt.axis('off')
 
-    # 第二行：频域幅度谱（对数尺度）
+    # Second row: frequency magnitude spectra (log scale)
     plt.subplot(3, 4, 5)
     plt.imshow(np.log1p(mag_original), cmap='gray')
-    plt.title('原图幅度谱 (log)', fontsize=12)
+    plt.title('Original Magnitude Spectrum (log)', fontsize=12)
     plt.axis('off')
 
     plt.subplot(3, 4, 6)
     plt.imshow(np.log1p(mag_enhanced), cmap='gray')
-    plt.title('增强图幅度谱 (log)', fontsize=12)
+    plt.title('Enhanced Magnitude Spectrum (log)', fontsize=12)
     plt.axis('off')
 
     plt.subplot(3, 4, 7)
     plt.imshow(np.log1p(mag_fused), cmap='gray')
-    plt.title('融合幅度谱 (log)', fontsize=12)
+    plt.title('Fused Magnitude Spectrum (log)', fontsize=12)
     plt.axis('off')
 
     plt.subplot(3, 4, 8)
-    # 显示权重矩阵的径向剖面
+    # show radial profile of the weight matrix
     center = weight_matrix.shape[0] // 2
     profile = weight_matrix[center, :]
     plt.plot(profile, linewidth=2)
-    plt.title(f'权重剖面 ({filter_type})', fontsize=12)
-    plt.xlabel('距离中心的像素')
-    plt.ylabel('权重值')
+    plt.title(f'Weight Profile ({filter_type})', fontsize=12)
+    plt.xlabel('Pixels from center')
+    plt.ylabel('Weight')
     plt.grid(True, alpha=0.3)
 
-    # 第三行：细节对比（裁剪中心区域）
+    # Third row: detail crops
     h, w = original_img.shape[:2]
     crop_size = min(h, w) // 3
     y1, y2 = h//2 - crop_size//2, h//2 + crop_size//2
@@ -301,24 +318,24 @@ def visualize_results(
 
     plt.subplot(3, 4, 9)
     plt.imshow(cv2.cvtColor(original_img[y1:y2, x1:x2], cv2.COLOR_BGR2RGB))
-    plt.title('原图细节', fontsize=12)
+    plt.title('Original Details', fontsize=12)
     plt.axis('off')
 
     plt.subplot(3, 4, 10)
     plt.imshow(cv2.cvtColor(enhanced_img[y1:y2, x1:x2], cv2.COLOR_BGR2RGB))
-    plt.title('增强图细节', fontsize=12)
+    plt.title('Enhanced Details', fontsize=12)
     plt.axis('off')
 
     plt.subplot(3, 4, 11)
     plt.imshow(cv2.cvtColor(fused_img[y1:y2, x1:x2], cv2.COLOR_BGR2RGB))
-    plt.title('融合图细节', fontsize=12)
+    plt.title('Fused Details', fontsize=12)
     plt.axis('off')
 
     plt.subplot(3, 4, 12)
-    # 显示差异图
+    # difference image
     diff = cv2.absdiff(original_img, fused_img)
     plt.imshow(cv2.cvtColor(diff, cv2.COLOR_BGR2RGB))
-    plt.title('原图与融合图差异', fontsize=12)
+    plt.title('Original vs Fused Difference', fontsize=12)
     plt.axis('off')
 
     plt.tight_layout()
@@ -330,7 +347,7 @@ def visualize_results(
     if save_dir and not os.path.exists(save_dir):
         os.makedirs(save_dir, exist_ok=True)
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f"✓ 可视化结果已保存到: {save_path}")
+    print(f"✓ Visualization saved to: {save_path}")
     plt.close()
 
 
@@ -340,13 +357,13 @@ def compare_filter_types(
     output_dir: str = '/home/ubuntu'
 ) -> None:
     """
-    对比不同权重过渡方式的融合效果
+    Compare fusion results for different weight transition types
     """
     filter_types = ['linear', 'gaussian', 'cosine', 'quadratic']
     results = []
 
     print("\n" + "="*70)
-    print("对比不同权重过渡方式的融合效果")
+    print("Compare different weight transition types")
     print("="*70)
 
     # 读取图像并检查
@@ -356,33 +373,60 @@ def compare_filter_types(
         raise FileNotFoundError(
             "compare_filter_types: 无法读取 original 或 enhanced 图像，请检查路径。")
 
+    # 若尺寸不一致，将增强图缩放到与原图相同尺寸（选择合适的插值）
+    # 如果尺寸不一致，为了可视化展示我们本地缩放 enhanced_img（不写磁盘）
+    if original_img.shape != enhanced_img.shape:
+        print(
+            f"   图像尺寸不一致，将增强图从 {enhanced_img.shape[:2]} 缩放到 {original_img.shape[:2]}（仅用于展示）")
+        # 若增强图更大则用 INTER_AREA 下采样；否则用 INTER_CUBIC 上采样
+        if enhanced_img.shape[0] > original_img.shape[0] or enhanced_img.shape[1] > original_img.shape[1]:
+            interp = cv2.INTER_AREA
+        else:
+            interp = cv2.INTER_CUBIC
+        enhanced_img = cv2.resize(
+            enhanced_img,
+            (original_img.shape[1], original_img.shape[0]),
+            interpolation=interp
+        )
+    # 不再写入临时文件，直接传入原始路径；frequency_fusion 会在读取时做必要的缩放
+    enhanced_path_to_use = enhanced_path
+
     for filter_type in filter_types:
         print(f"\n处理 {filter_type} 过滤器...")
         output_path = f"{output_dir}/fused_{filter_type}.jpg"
 
         fused_img = frequency_fusion(
             original_path=original_path,
-            enhanced_path=enhanced_path,
+            enhanced_path=enhanced_path_to_use,
             output_path=output_path,
             filter_type=filter_type,
             visualize=False
         )
         results.append((filter_type, fused_img))
 
-    # 创建对比图
-    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    # 新增：RGB 逐像素平均融合（直接在 RGB 空间做平均）
+    print("\n处理 rgb_average 平均融合...")
+    rgb_avg = ((original_img.astype(np.float32) +
+               enhanced_img.astype(np.float32)) / 2.0).astype(np.uint8)
+    rgb_avg_path = f"{output_dir}/fused_rgb_average.jpg"
+    cv2.imwrite(rgb_avg_path, rgb_avg)
+    results.append(('rgb_average', rgb_avg))
+
+    # 创建对比图（扩展列以包含 rgb_average）
+    fig, axes = plt.subplots(2, 5, figsize=(25, 10))
 
     # 显示原图和增强图
     axes[0, 0].imshow(cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB))
-    axes[0, 0].set_title('原始图像', fontsize=14, fontweight='bold')
+    axes[0, 0].set_title('Original Image', fontsize=14, fontweight='bold')
     axes[0, 0].axis('off')
 
     axes[0, 1].imshow(cv2.cvtColor(enhanced_img, cv2.COLOR_BGR2RGB))
-    axes[0, 1].set_title('AI增强图像', fontsize=14, fontweight='bold')
+    axes[0, 1].set_title('AI Enhanced Image', fontsize=14, fontweight='bold')
     axes[0, 1].axis('off')
 
-    # 显示权重矩阵对比
-    axes[0, 2].set_title('权重剖面对比', fontsize=14, fontweight='bold')
+    # 权重剖面对比（放在第0行第2列）
+    axes[0, 2].set_title('Weight Profile Comparison',
+                         fontsize=14, fontweight='bold')
     for filter_type in filter_types:
         weight = create_frequency_weight_matrix(
             original_img.shape[:2], filter_type)
@@ -391,21 +435,25 @@ def compare_filter_types(
         axes[0, 2].plot(profile, label=filter_type, linewidth=2)
     axes[0, 2].legend()
     axes[0, 2].grid(True, alpha=0.3)
-    axes[0, 2].set_xlabel('距离中心的像素')
-    axes[0, 2].set_ylabel('权重值')
+    axes[0, 2].set_xlabel('Pixels from center')
+    axes[0, 2].set_ylabel('Weight')
 
-    # 显示不同过滤器的融合结果
+    # 保持第0行第3和第4列为空（或可用于其他可视化扩展）
+    axes[0, 3].axis('off')
+    axes[0, 4].axis('off')
+
+    # 显示不同过滤器的融合结果（包含新增的 rgb_average）
     for idx, (filter_type, fused_img) in enumerate(results):
         col = idx
         axes[1, col].imshow(cv2.cvtColor(fused_img, cv2.COLOR_BGR2RGB))
         axes[1, col].set_title(
-            f'融合结果 ({filter_type})', fontsize=14, fontweight='bold')
+            f'Fused Result ({filter_type})', fontsize=14, fontweight='bold')
         axes[1, col].axis('off')
 
     plt.tight_layout()
     comparison_path = f"{output_dir}/filter_comparison.png"
     plt.savefig(comparison_path, dpi=150, bbox_inches='tight')
-    print(f"\n✓ 对比结果已保存到: {comparison_path}")
+    print(f"\n✓ Comparison saved to: {comparison_path}")
     plt.close()
 
 

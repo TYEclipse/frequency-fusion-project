@@ -7,49 +7,66 @@ import importlib
 import importlib.util
 import os
 import sys
+import traceback
+from typing import Optional, Callable
 
 # 确定项目根目录（用于查找本地模块）
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _load_frequency_fusion(name: str = "frequency_fusion"):
-    """
-    稳健加载 frequency_fusion 模块：
-    1) 先尝试正常 import（适用于已 pip install 的情况）
-    2) 若失败，查找 PROJECT_ROOT 下的 frequency_fusion.py 或 package/__init__.py，使用 importlib 动态加载
-    """
+    """稳健加载 frequency_fusion 模块（简化注释、保持行为）。"""
     try:
         return importlib.import_module(name)
-    except Exception:
-        # 尝试从项目源码直接加载（不依赖 sys.path 顺序或格式化）
-        candidates = [
-            os.path.join(PROJECT_ROOT, f"{name}.py"),
-            os.path.join(PROJECT_ROOT, name, "__init__.py"),
-        ]
-        for path in candidates:
-            if os.path.exists(path):
-                spec = importlib.util.spec_from_file_location(name, path)
-                module = importlib.util.module_from_spec(spec)
-                # 将模块注册到 sys.modules，避免重复加载问题
-                sys.modules[name] = module
-                spec.loader.exec_module(module)
-                return module
-        # 作为最后保证，可把项目根加入 sys.path 再尝试一次 import
-        if PROJECT_ROOT not in sys.path:
-            sys.path.insert(0, PROJECT_ROOT)
-            try:
-                return importlib.import_module(name)
-            except Exception:
-                pass
-        # 仍失败则抛出清晰错误
-        raise ModuleNotFoundError(
-            f"无法加载模块 '{name}'（既未安装也未在 {PROJECT_ROOT} 中找到源码）")
+    except ModuleNotFoundError:
+        pass
+
+    candidates = [
+        os.path.join(PROJECT_ROOT, f"{name}.py"),
+        os.path.join(PROJECT_ROOT, name, "__init__.py"),
+    ]
+
+    last_exc: Optional[Exception] = None
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or getattr(spec, "loader", None) is None:
+            last_exc = ImportError(f"无法为路径 {path} 获取有效的 ModuleSpec/loader")
+            continue
+        module = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(module)  # type: ignore[attr-defined]
+        except Exception as e:
+            last_exc = e
+            continue
+        # exec_module 成功后再注册到 sys.modules
+        sys.modules[name] = module
+        return module
+
+    if PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, PROJECT_ROOT)
+        try:
+            return importlib.import_module(name)
+        except Exception as e:
+            last_exc = e
+
+    msg = f"无法加载模块 '{name}'（既未安装也未在 {PROJECT_ROOT} 中找到有效源码）"
+    if last_exc:
+        raise ModuleNotFoundError(msg) from last_exc
+    raise ModuleNotFoundError(msg)
 
 
 # 取得模块对象并从中导出所需函数
 _frequency_module = _load_frequency_fusion("frequency_fusion")
-compare_filter_types = getattr(_frequency_module, "compare_filter_types")
-frequency_fusion = getattr(_frequency_module, "frequency_fusion")
+
+# 校验模块导出
+compare_filter_types = getattr(_frequency_module, "compare_filter_types", None)
+frequency_fusion = getattr(_frequency_module, "frequency_fusion", None)
+if not callable(frequency_fusion) or not callable(compare_filter_types):
+    raise ImportError(
+        "加载的模块 'frequency_fusion' 未能导出可调用的 'frequency_fusion' 和 'compare_filter_types'。"
+    )
 
 # 直接导入，若导入失败让错误冒泡，便于尽早发现问题
 
@@ -71,7 +88,6 @@ def example_basic_fusion(original_path: str = ORIGINAL_PATH, enhanced_path: str 
     print("示例1: 基本图像融合（线性权重）")
     print("="*70)
 
-    # fused_img 未被使用，直接调用函数即可
     frequency_fusion(
         original_path=original_path,
         enhanced_path=enhanced_path,
@@ -92,7 +108,6 @@ def example_gaussian_fusion(original_path: str = ORIGINAL_PATH, enhanced_path: s
     print("示例2: 高斯权重融合")
     print("="*70)
 
-    # fused_img 未被使用，直接调用函数即可
     frequency_fusion(
         original_path=original_path,
         enhanced_path=enhanced_path,
@@ -130,7 +145,6 @@ def example_lab_colorspace(original_path: str = ORIGINAL_PATH, enhanced_path: st
     print("示例4: 使用Lab色彩空间")
     print("="*70)
 
-    # fused_img 未被使用，直接调用函数即可
     frequency_fusion(
         original_path=original_path,
         enhanced_path=enhanced_path,
@@ -141,6 +155,40 @@ def example_lab_colorspace(original_path: str = ORIGINAL_PATH, enhanced_path: st
     )
 
     print("✓ 融合完成！查看 fused_lab.jpg")
+
+
+def _load_helper_callable(module_name: str, func_name: str) -> Callable:
+    """从 PROJECT_ROOT 加载辅助模块并返回可调用符号（简化实现）。"""
+    try:
+        mod = importlib.import_module(module_name)
+    except ModuleNotFoundError:
+        mod = None
+
+    if mod is None:
+        py_path = os.path.join(PROJECT_ROOT, f"{module_name}.py")
+        init_path = os.path.join(PROJECT_ROOT, module_name, "__init__.py")
+        for path in (py_path, init_path):
+            if not os.path.exists(path):
+                continue
+            spec = importlib.util.spec_from_file_location(module_name, path)
+            if spec is None or getattr(spec, "loader", None) is None:
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            try:
+                spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+            except Exception as e:
+                raise ImportError(
+                    f"从 {path} 导入模块 {module_name} 失败: {e}") from e
+            sys.modules[module_name] = mod
+            break
+
+    if mod is None:
+        raise ModuleNotFoundError(f"无法导入辅助模块: {module_name}")
+
+    fn = getattr(mod, func_name, None)
+    if not callable(fn):
+        raise ImportError(f"模块 {module_name} 不包含可调用的 {func_name}")
+    return fn
 
 
 if __name__ == "__main__":
@@ -159,14 +207,26 @@ if __name__ == "__main__":
         print("\n⚠ 未找到测试图像！")
         print(f"正在创建演示图像到: {TEST_DIR} ...")
 
-        # 导入并运行测试图像生成器（保持向后兼容）
-        from create_test_images import create_test_images
+        # 使用健壮加载器加载 create_test_images.create_test_images
+        try:
+            create_test_images = _load_helper_callable(
+                'create_test_images', 'create_test_images')
+        except Exception as e:
+            print(f"❌ 无法加载 create_test_images: {e}")
+            traceback.print_exc()
+            raise
+
         try:
             # 优先尝试传入目标目录（若 create_test_images 支持该签名）
             create_test_images(TEST_DIR)
         except TypeError:
             # 回退：无参调用
             create_test_images()
+        except Exception as e:
+            print(f"❌ 生成测试图像时出错: {e}")
+            traceback.print_exc()
+            raise
+
         print(
             f"\n✓ 测试图像已创建:\n  - {ORIGINAL_PATH} (原始图像)\n  - {ENHANCED_PATH} (AI增强图像)\n")
 
@@ -186,10 +246,10 @@ if __name__ == "__main__":
         print(f"  - {os.path.join(TEST_DIR, 'fused_cosine.jpg')}")
         print(f"  - {os.path.join(TEST_DIR, 'fused_quadratic.jpg')}")
         print(f"  - {os.path.join(TEST_DIR, 'fused_lab.jpg')}")
+        print(f"  - {os.path.join(TEST_DIR, 'fused_rgb_average.jpg')}")
         print(f"  - {os.path.join(TEST_DIR, 'fusion_visualization.png')}")
         print(f"  - {os.path.join(TEST_DIR, 'filter_comparison.png')}")
 
     except Exception as e:
         print(f"\n❌ 错误: {e}")
-        import traceback
         traceback.print_exc()
