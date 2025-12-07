@@ -3,6 +3,8 @@
 创建测试图像：模拟原始图像和AI增强图像
 """
 
+import argparse
+import logging
 import os
 from pathlib import Path
 
@@ -10,106 +12,172 @@ import cv2
 import numpy as np
 
 
-def create_test_images(height: int = 512, width: int = 512, seed: int | None = None, output_dir: str | None = None):
-    """
-    创建一对测试图像：
-    - original.jpg: 原始图像（正常亮度，丰富细节）
-    - enhanced.jpg: AI增强图像（色彩鲜艳，对比度高，但可能丢失细节）
-    参数：
-      height, width: 图像尺寸
-      seed: 可选随机种子（用于复现噪声）
-      output_dir: 可选输出目录（路径字符串或 None 使用项目默认）
-    """
-    # 可选的随机种子以保证可复现
-    if seed is not None:
-        np.random.seed(seed)
+def set_random_seed(seed: int | None) -> np.random.Generator:
+    """返回一个 numpy Generator（不再设置全局 RNG），便于可复现性且无全局副作用。"""
+    # 使用 default_rng 保持现代 RNG 语义，返回 generator 由调用方传递给需要随机性的函数。
+    return np.random.default_rng(seed)
 
-    # ==================== 创建原始图像 ====================
-    # 生成背景通道：注意 c0/c1 需要显式广播到 (height, width) 再堆叠
+
+def generate_background(height: int, width: int) -> np.ndarray:
+    """生成基础背景（三个通道），返回 uint8 图像。"""
     ys = np.arange(height).reshape(height, 1)
     xs = np.arange(width).reshape(1, width)
-    # shape (height,1)
-    c0 = 100 + 50 * np.sin(2 * np.pi * ys / height)
-    # shape (1,width)
-    c1 = 120 + 40 * np.cos(2 * np.pi * xs / width)
-    c2 = 140 + 30 * np.sin(2 * np.pi * (ys + xs) /
-                           (height + width))      # shape (height,width)
+    c0 = 100 + 50 * np.sin(2 * np.pi * ys / height)   # shape (height, 1)
+    c1 = 120 + 40 * np.cos(2 * np.pi * xs / width)    # shape (1, width)
+    # broadcasts to (height, width)
+    c2 = 140 + 30 * np.sin(2 * np.pi * (ys + xs) / (height + width))
+    # 将 c0/c1 显式广播为 (height, width) 后再 stack，避免 shape 不匹配错误
     c0 = np.broadcast_to(c0, (height, width))
     c1 = np.broadcast_to(c1, (height, width))
-    original = np.stack([c0, c1, c2], axis=-1)
-    original = np.clip(original, 0, 255).astype(np.uint8)
+    bg = np.stack([c0, c1, c2], axis=-1)
+    return np.clip(bg, 0, 255).astype(np.uint8)
 
-    # 添加几何图形（中频）
-    cv2.circle(original, (width // 4, height // 4), 60, (80, 150, 200), -1)
-    cv2.circle(original, (3 * width // 4, height // 4), 60, (200, 100, 80), -1)
-    cv2.rectangle(original, (width // 4 - 40, 3 * height // 4 - 40),
+
+def add_geometric_shapes(img: np.ndarray):
+    """在图像上绘制中频几何图形（就地修改）。"""
+    height, width = img.shape[:2]
+    cv2.circle(img, (width // 4, height // 4), 60, (80, 150, 200), -1)
+    cv2.circle(img, (3 * width // 4, height // 4), 60, (200, 100, 80), -1)
+    cv2.rectangle(img, (width // 4 - 40, 3 * height // 4 - 40),
                   (width // 4 + 40, 3 * height // 4 + 40), (100, 200, 100), -1)
-    cv2.rectangle(original, (3 * width // 4 - 40, 3 * height // 4 - 40),
+    cv2.rectangle(img, (3 * width // 4 - 40, 3 * height // 4 - 40),
                   (3 * width // 4 + 40, 3 * height // 4 + 40), (200, 200, 50), -1)
 
-    # 添加文字（高频细节）
+
+def add_text(img: np.ndarray, text: str = "ORIGINAL"):
+    """在图像中心添加文字（就地修改）。"""
+    height, width = img.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
-    cv2.putText(original, 'ORIGINAL', (width // 2 - 120, height // 2),
+    cv2.putText(img, text, (width // 2 - 120, height // 2),
                 font, 1.5, (255, 255, 255), 2, cv2.LINE_AA)
 
-    # 添加细节纹理（高频）
-    noise = np.random.randint(-20, 20, (height, width, 3), dtype=np.int16)
-    original = np.clip(original.astype(np.int16) +
-                       noise, 0, 255).astype(np.uint8)
 
-    # 添加网格线（高频细节）
-    # 使用数组切片替代循环绘制网格线（更快且更简洁）
-    original[::32, :, :] = 255
-    original[:, ::32, :] = 255
+def add_texture_noise(img: np.ndarray, noise_range: tuple[int, int] = (-20, 20), rng: np.random.Generator | None = None):
+    """向图像添加高频随机噪声（就地修改）。"""
+    if rng is None:
+        rng = np.random.default_rng()
+    noise = rng.integers(
+        noise_range[0], noise_range[1], size=img.shape, dtype=np.int16)
+    img[:] = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
-    # ==================== 创建增强图像 ====================
-    # 模拟AI增强：提高对比度和饱和度，但可能丢失细节
-    enhanced = original.copy()
 
-    # 转换到HSV空间以增强饱和度
-    # 以 float 进行比例调整，最后一次性转换回 uint8
-    hsv = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV).astype(np.float32)
-    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.5, 0, 255)
-    hsv[:, :, 2] = np.clip(hsv[:, :, 2] * 1.2, 0, 255)
-    enhanced = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+def add_grid_lines(img: np.ndarray, step: int = 32, color: int = 255):
+    """添加网格线（就地修改）。"""
+    img[::step, :, :] = color
+    img[:, ::step, :] = color
 
-    # 增强对比度
-    lab = cv2.cvtColor(enhanced, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+def enhance_saturation_value(img: np.ndarray, sat_scale: float = 1.5, val_scale: float = 1.2) -> np.ndarray:
+    """在 HSV 空间调整饱和度与明度并返回新图像（不修改原图）。"""
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * sat_scale, 0, 255)
+    hsv[:, :, 2] = np.clip(hsv[:, :, 2] * val_scale, 0, 255)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+
+def enhance_contrast_lab(img: np.ndarray, contrast_scale: float = 1.3) -> np.ndarray:
+    """在 LAB 空间对亮度通道进行线性对比度增强并返回新图像。"""
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     l = lab[:, :, 0]
     l_mean = float(np.mean(l))
-    lab[:, :, 0] = np.clip((l - l_mean) * 1.3 + l_mean, 0, 255)
-    enhanced = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    lab[:, :, 0] = np.clip((l - l_mean) * contrast_scale + l_mean, 0, 255)
+    return cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
 
-    # 轻微模糊（模拟AI增强可能丢失的高频细节）
-    enhanced = cv2.GaussianBlur(enhanced, (3, 3), 0.5)
 
-    # 保存图像（默认到项目根的 test_images 文件夹，支持传入自定义 output_dir）
-    if output_dir is None:
+def apply_blur(img: np.ndarray, ksize: tuple[int, int] = (3, 3), sigma: float = 0.5) -> np.ndarray:
+    """对图像应用高斯模糊并返回新图像。"""
+    return cv2.GaussianBlur(img, ksize, sigma)
+
+
+def simulate_ai_enhancement(img: np.ndarray,
+                            sat_scale: float = 1.5,
+                            val_scale: float = 1.2,
+                            contrast_scale: float = 1.3,
+                            blur_ksize: tuple[int, int] = (3, 3),
+                            blur_sigma: float = 0.5) -> np.ndarray:
+    """模拟 AI 增强流水线：饱和度/明度 -> 对比度 -> 模糊。返回增强后的图像。"""
+    enhanced = enhance_saturation_value(img, sat_scale, val_scale)
+    enhanced = enhance_contrast_lab(enhanced, contrast_scale)
+    enhanced = apply_blur(enhanced, blur_ksize, blur_sigma)
+    return enhanced
+
+
+def ensure_output_dir(path: str | Path | None) -> Path:
+    """确保并返回输出目录 Path。"""
+    if path is None:
         output_dir = Path(__file__).parent.parent / "test_images"
     else:
-        output_dir = Path(output_dir)
+        output_dir = Path(path)
     output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
 
+
+def save_image(path: Path, img: np.ndarray):
+    """保存单张图像，保存失败时抛出 IOError。"""
+    if not cv2.imwrite(str(path), img):
+        raise IOError(f"Failed to write image: {path}")
+
+
+def create_comparison_image(original: np.ndarray, enhanced: np.ndarray) -> np.ndarray:
+    """水平拼接原始与增强图以便对比（返回新图像）。"""
+    return np.hstack([original, enhanced])
+
+
+def create_test_images(height: int = 512, width: int = 512, seed: int | None = None, output_dir: str | None = None):
+    """
+    创建一对测试图像并保存。
+    注意：以下函数会就地修改 original（add_geometric_shapes / add_text / add_texture_noise / add_grid_lines）。
+    """
+    # 设置并获取 RNG（不影响全局 np.random 状态）
+    rng = set_random_seed(seed)
+
+    # 生成原始图像并逐步添加细节（会就地修改 original）
+    original = generate_background(height, width)
+    add_geometric_shapes(original)
+    add_text(original)
+    add_texture_noise(original, rng=rng)
+    add_grid_lines(original)
+
+    # 模拟增强（返回新图）
+    enhanced = simulate_ai_enhancement(original)
+
+    # 在拼接前检查形状/通道一致性，避免 np.hstack 报错
+    if original.shape != enhanced.shape:
+        logging.warning("original 与 enhanced 尺寸或通道不匹配，尝试调整为相同 dtype 和通道数。")
+        # 强制转换为相同 dtype/通道（简单策略）
+        h = min(original.shape[0], enhanced.shape[0])
+        w = min(original.shape[1], enhanced.shape[1])
+        original = original[:h, :w]
+        enhanced = enhanced[:h, :w]
+
+    # 准备输出目录并保存
+    output_dir = ensure_output_dir(output_dir)
     original_path = output_dir / "original.jpg"
     enhanced_path = output_dir / "enhanced.jpg"
     comparison_path = output_dir / "test_images_comparison.jpg"
 
-    # 检查写入结果并在失败时抛出提示
-    if not cv2.imwrite(str(original_path), original):
-        raise IOError(f"Failed to write image: {original_path}")
-    if not cv2.imwrite(str(enhanced_path), enhanced):
-        raise IOError(f"Failed to write image: {enhanced_path}")
+    save_image(original_path, original)
+    save_image(enhanced_path, enhanced)
 
-    print("✓ 测试图像已创建:")
-    print(f"  - {os.path.relpath(original_path)} (原始图像)")
-    print(f"  - {os.path.relpath(enhanced_path)} (AI增强图像)")
+    logging.info("✓ 测试图像已创建:")
+    logging.info(f"  - {os.path.relpath(os.fspath(original_path))} (原始图像)")
+    logging.info(f"  - {os.path.relpath(os.fspath(enhanced_path))} (AI增强图像)")
 
-    # 创建对比图
-    comparison = np.hstack([original, enhanced])
-    if not cv2.imwrite(str(comparison_path), comparison):
-        raise IOError(f"Failed to write image: {comparison_path}")
-    print(f"  - {os.path.relpath(str(comparison_path))} (对比图)")
+    comparison = create_comparison_image(original, enhanced)
+    save_image(comparison_path, comparison)
+    logging.info(f"  - {os.path.relpath(os.fspath(comparison_path))} (对比图)")
 
 
 if __name__ == "__main__":
-    create_test_images()
+    logging.basicConfig(level=logging.INFO,
+                        format="%(levelname)s: %(message)s")
+    parser = argparse.ArgumentParser(
+        description="生成测试图像（original + enhanced + comparison）")
+    parser.add_argument("--height", type=int, default=512)
+    parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--output-dir", type=str, default=None)
+    args = parser.parse_args()
+
+    create_test_images(height=args.height, width=args.width,
+                       seed=args.seed, output_dir=args.output_dir)
